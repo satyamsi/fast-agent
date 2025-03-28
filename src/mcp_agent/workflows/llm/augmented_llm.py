@@ -75,6 +75,8 @@ class AugmentedLLM(ContextDependent, AugmentedLLMProtocol[MessageParamT, Message
         If a name is provided, it will be used to identify the LLM.
         If an agent is provided, all other properties are optional
         """
+        if context is None and agent is not None:
+            context = agent.context
         # Extract request_params before super() call
         self._init_request_params = request_params
         super().__init__(context=context, **kwargs)
