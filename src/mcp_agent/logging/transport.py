@@ -434,6 +434,7 @@ class AsyncEventBus:
                 # If we have a current event, mark it done before breaking
                 if event is not None:
                     self._queue.task_done()
+                    event = None
                 break
             except Exception as e:
                 print(f"Error in event processing loop: {e}")
