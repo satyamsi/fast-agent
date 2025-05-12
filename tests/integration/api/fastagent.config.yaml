@@ -54,3 +54,6 @@ mcp:
       command: "prompt-server"
       args: ["multi.txt"]
       cwd: "../prompt-server/"
+    dynamic_tool:
+      command: "uv"
+      args: ["run", "mcp_dynamic_tools.py"]

@@ -138,6 +138,9 @@ class MCPAggregator(ContextDependent):
         self._prompt_cache: Dict[str, List[Prompt]] = {}
         self._prompt_cache_lock = Lock()
 
+        # Lock for refreshing tools from a server
+        self._refresh_lock = Lock()
+
     async def close(self) -> None:
         """
         Close all persistent connections when the aggregator is deleted.
@@ -217,8 +220,18 @@ class MCPAggregator(ContextDependent):
                     },
                 )
 
+                # Create a wrapper to capture the parameters for the client session
+                def session_factory(read_stream, write_stream, read_timeout):
+                    return MCPAgentClientSession(
+                        read_stream,
+                        write_stream,
+                        read_timeout,
+                        server_name=server_name,
+                        tool_list_changed_callback=self._handle_tool_list_changed,
+                    )
+
                 await self._persistent_connection_manager.get_server(
-                    server_name, client_session_factory=MCPAgentClientSession
+                    server_name, client_session_factory=session_factory
                 )
 
             logger.info(
@@ -261,8 +274,20 @@ class MCPAggregator(ContextDependent):
                 tools = await fetch_tools(server_connection.session)
                 prompts = await fetch_prompts(server_connection.session, server_name)
             else:
+                # Create a factory function for the client session
+                def create_session(read_stream, write_stream, read_timeout):
+                    return MCPAgentClientSession(
+                        read_stream,
+                        write_stream,
+                        read_timeout,
+                        server_name=server_name,
+                        tool_list_changed_callback=self._handle_tool_list_changed,
+                    )
+
                 async with gen_client(
-                    server_name, server_registry=self.context.server_registry
+                    server_name,
+                    server_registry=self.context.server_registry,
+                    client_session_factory=create_session,
                 ) as client:
                     tools = await fetch_tools(client)
                     prompts = await fetch_prompts(client, server_name)
@@ -383,6 +408,15 @@ class MCPAggregator(ContextDependent):
                 for namespaced_tool_name, namespaced_tool in self._namespaced_tool_map.items()
             ]
         )
+
+    async def refresh_all_tools(self) -> None:
+        """
+        Refresh the tools for all servers.
+        This is useful when you know tools have changed but haven't received notifications.
+        """
+        logger.info("Refreshing tools for all servers")
+        for server_name in self.server_names:
+            await self._refresh_server_tools(server_name)
 
     async def _execute_on_server(
         self,
@@ -863,6 +897,101 @@ class MCPAggregator(ContextDependent):
 
         logger.debug(f"Available prompts across servers: {results}")
         return results
+
+    async def _handle_tool_list_changed(self, server_name: str) -> None:
+        """
+        Callback handler for ToolListChangedNotification.
+        This will refresh the tools for the specified server.
+
+        Args:
+            server_name: The name of the server whose tools have changed
+        """
+        logger.info(f"Tool list changed for server '{server_name}', refreshing tools")
+
+        # Refresh the tools for this server
+        await self._refresh_server_tools(server_name)
+
+    async def _refresh_server_tools(self, server_name: str) -> None:
+        """
+        Refresh the tools for a specific server.
+
+        Args:
+            server_name: The name of the server to refresh tools for
+        """
+        if not await self.validate_server(server_name):
+            logger.error(f"Cannot refresh tools for unknown server '{server_name}'")
+            return
+
+        async with self._refresh_lock:
+            try:
+                # Fetch new tools from the server
+                if self.connection_persistence:
+                    # Create a factory function that will include our parameters
+                    def create_session(read_stream, write_stream, read_timeout):
+                        return MCPAgentClientSession(
+                            read_stream,
+                            write_stream,
+                            read_timeout,
+                            server_name=server_name,
+                            tool_list_changed_callback=self._handle_tool_list_changed,
+                        )
+
+                    server_connection = await self._persistent_connection_manager.get_server(
+                        server_name, client_session_factory=create_session
+                    )
+                    tools_result = await server_connection.session.list_tools()
+                    new_tools = tools_result.tools or []
+                else:
+                    # Create a factory function for the client session
+                    def create_session(read_stream, write_stream, read_timeout):
+                        return MCPAgentClientSession(
+                            read_stream,
+                            write_stream,
+                            read_timeout,
+                            server_name=server_name,
+                            tool_list_changed_callback=self._handle_tool_list_changed,
+                        )
+
+                    async with gen_client(
+                        server_name,
+                        server_registry=self.context.server_registry,
+                        client_session_factory=create_session,
+                    ) as client:
+                        tools_result = await client.list_tools()
+                        new_tools = tools_result.tools or []
+
+                # Update tool maps
+                async with self._tool_map_lock:
+                    # Remove old tools for this server
+                    old_tools = self._server_to_tool_map.get(server_name, [])
+                    for old_tool in old_tools:
+                        if old_tool.namespaced_tool_name in self._namespaced_tool_map:
+                            del self._namespaced_tool_map[old_tool.namespaced_tool_name]
+
+                    # Add new tools
+                    self._server_to_tool_map[server_name] = []
+                    for tool in new_tools:
+                        namespaced_tool_name = create_namespaced_name(server_name, tool.name)
+                        namespaced_tool = NamespacedTool(
+                            tool=tool,
+                            server_name=server_name,
+                            namespaced_tool_name=namespaced_tool_name,
+                        )
+
+                        self._namespaced_tool_map[namespaced_tool_name] = namespaced_tool
+                        self._server_to_tool_map[server_name].append(namespaced_tool)
+
+                logger.info(
+                    f"Successfully refreshed tools for server '{server_name}'",
+                    data={
+                        "progress_action": ProgressAction.UPDATED,
+                        "server_name": server_name,
+                        "agent_name": self.agent_name,
+                        "tool_count": len(new_tools),
+                    },
+                )
+            except Exception as e:
+                logger.error(f"Failed to refresh tools for server '{server_name}': {e}")
 
     async def get_resource(
         self, resource_uri: str, server_name: str | None = None
